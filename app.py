@@ -45,12 +45,12 @@ def clamp(x: float, lo=0.0, hi=1.0) -> float:
 @dataclass
 class TeamProfile:
     name: str
-    goals_for: float           # ממוצע שערים
-    goals_against: float       # ממוצע ספיגה
-    form_points_5: int         # נק' ב-5 אחרונים (0-15)
-    corners_for: float         # קרנות למשחק
-    corners_against: float     # קרנות נגד
-    home_adv: float = 0.10     # יתרון ביתיות קטן (לדמו)
+    goals_for: float
+    goals_against: float
+    form_points_5: int         # 0-15
+    corners_for: float
+    corners_against: float
+    home_adv: float = 0.10
 
 @dataclass
 class MatchItem:
@@ -60,10 +60,9 @@ class MatchItem:
     away: TeamProfile
 
 # =====================
-# DEMO DATA (עד שיגיע API)
+# DEMO DATA
 # =====================
 def demo_matches() -> List[MatchItem]:
-    # אפשר לשנות/להוסיף ידנית פה בקלות
     return [
         MatchItem(
             league="La Liga",
@@ -86,46 +85,55 @@ def demo_matches() -> List[MatchItem]:
     ]
 
 # =====================
-# ANALYST ENGINE (חיזוק)
+# BET TYPES
+# =====================
+BET_TYPES = [
+    "Home Win",
+    "Draw",
+    "Away Win",
+    "Double Chance (1X)",
+    "Double Chance (X2)",
+    "Double Chance (12)",
+    "Over 0.5",
+    "Over 1.5",
+    "Over 2.5",
+    "Under 2.5",
+    "BTTS (Yes)",
+    "BTTS (No)",
+    "Home to Score",
+    "Away to Score",
+    "Over 8.5 Corners",
+    "Under 10.5 Corners",
+]
+
+# =====================
+# ANALYST ENGINE
 # =====================
 def expected_total_goals(m: MatchItem) -> float:
-    # ממוצע שערים צפוי: התקפה מול הגנה + איזון
-    # בסיס: (הבקעה בית + ספיגה חוץ)/2 + (הבקעה חוץ + ספיגה בית)/2
     home_part = (m.home.goals_for + m.away.goals_against) / 2
     away_part = (m.away.goals_for + m.home.goals_against) / 2
-
-    # יתרון ביתיות קטן: מעלה את ההבקעה הביתית קצת
     home_part *= (1 + m.home.home_adv)
-
-    # מומנטום (5 משחקים): כל נקודה מעל 7 מוסיפה מעט, מתחת מורידה מעט
     form_boost = ((m.home.form_points_5 - 7) - (m.away.form_points_5 - 7)) * 0.02
     total = (home_part + away_part) * (1 + form_boost)
-
     return max(0.8, min(4.2, total))
 
 def btts_estimate(m: MatchItem) -> float:
-    # אם לשתי הקבוצות יש מעל 1.0 שער למשחק וסופגות לא מעט -> BTTS עולה
     base = (min(m.home.goals_for, m.away.goals_for) / max(m.home.goals_for, m.away.goals_for)) * 0.8 + 0.1
     defense_factor = ((m.home.goals_against + m.away.goals_against) / 2) / 1.4
     return clamp(base * clamp(defense_factor, 0.7, 1.2), 0.15, 0.85)
 
 def win_side_estimate(m: MatchItem) -> Tuple[str, float]:
-    # הערכה גסה לצד חזק יותר: התקפה-ספיגה + מומנטום
     home_strength = (m.home.goals_for - m.home.goals_against) + (m.home.form_points_5 / 15) * 0.6 + 0.15
     away_strength = (m.away.goals_for - m.away.goals_against) + (m.away.form_points_5 / 15) * 0.6
-
     diff = home_strength - away_strength
     if diff >= 0.35:
         return ("Home Win", clamp(0.55 + diff * 0.25, 0.55, 0.78))
     if diff <= -0.35:
         return ("Away Win", clamp(0.55 + (-diff) * 0.25, 0.55, 0.78))
-    # קרוב -> דאבל צ'אנס
     return ("Double Chance (1X)", clamp(0.60 + diff * 0.10, 0.58, 0.72))
 
 def corners_estimate(m: MatchItem) -> Tuple[str, float]:
-    # קרנות: סכום קרנות בעד / נגד
     est_total = (m.home.corners_for + m.away.corners_for + m.home.corners_against + m.away.corners_against) / 2
-    # קו דמו
     line = 8.5
     prob_over = clamp((est_total - line) * 0.10 + 0.55, 0.35, 0.75)
     pick = "Over 8.5 Corners" if prob_over >= 0.55 else "Under 10.5 Corners"
@@ -139,128 +147,149 @@ def risk_label(conf: float) -> str:
         return "בינוני"
     return "מסוכן"
 
-def analyze_match(m: MatchItem) -> Dict:
-    total_goals = expected_total_goals(m)
-    p_over25 = over_probability(total_goals, 2.5)
-    p_over15 = over_probability(total_goals, 1.5)
+def build_probability_table(m: MatchItem) -> Dict[str, float]:
+    tg = expected_total_goals(m)
+    p_over05 = over_probability(tg, 0.5)
+    p_over15 = over_probability(tg, 1.5)
+    p_over25 = over_probability(tg, 2.5)
+    p_under25 = clamp(1.0 - p_over25, 0.05, 0.95)
 
-    btts = btts_estimate(m)
+    btts_yes = btts_estimate(m)
+    btts_no = clamp(1.0 - btts_yes, 0.10, 0.90)
+
     win_pick, win_prob = win_side_estimate(m)
+
+    # הערכת 1X2 בסיסית (דמו)
+    if win_pick == "Home Win":
+        p_home = win_prob
+        p_draw = clamp((1 - p_home) * 0.45, 0.10, 0.35)
+        p_away = clamp(1 - p_home - p_draw, 0.05, 0.40)
+    elif win_pick == "Away Win":
+        p_away = win_prob
+        p_draw = clamp((1 - p_away) * 0.45, 0.10, 0.35)
+        p_home = clamp(1 - p_away - p_draw, 0.05, 0.40)
+    else:
+        p_home = clamp(win_prob * 0.55, 0.25, 0.55)
+        p_draw = clamp(win_prob * 0.35, 0.18, 0.38)
+        p_away = clamp(1 - p_home - p_draw, 0.10, 0.45)
+
+    p_1x = clamp(p_home + p_draw, 0.45, 0.90)
+    p_x2 = clamp(p_away + p_draw, 0.45, 0.90)
+    p_12 = clamp(p_home + p_away, 0.50, 0.92)
+
+    p_home_score = clamp(m.home.goals_for / 2.1, 0.45, 0.82)
+    p_away_score = clamp(m.away.goals_for / 2.1, 0.40, 0.78)
+
     corners_pick, corners_prob = corners_estimate(m)
+    p_over_corners = corners_prob if corners_pick.startswith("Over") else clamp(1 - corners_prob, 0.30, 0.70)
+    p_under_corners = clamp(1 - p_over_corners, 0.30, 0.70)
 
-    # המלצות מועמדות (מה שנחשב “הכי חזק”)
-    candidates = [
-        ("Over 2.5", p_over25),
-        ("Over 1.5", p_over15),
-        ("BTTS (Yes)", btts),
-        (win_pick, win_prob),
-        (corners_pick, corners_prob),
-        ("Home to Score", clamp(m.home.goals_for / 2.1, 0.45, 0.82)),
-        ("Away to Score", clamp(m.away.goals_for / 2.1, 0.40, 0.78)),
-    ]
-    candidates = sorted(candidates, key=lambda x: x[1], reverse=True)
+    return {
+        "Home Win": p_home,
+        "Draw": p_draw,
+        "Away Win": p_away,
+        "Double Chance (1X)": p_1x,
+        "Double Chance (X2)": p_x2,
+        "Double Chance (12)": p_12,
+        "Over 0.5": p_over05,
+        "Over 1.5": p_over15,
+        "Over 2.5": p_over25,
+        "Under 2.5": p_under25,
+        "BTTS (Yes)": btts_yes,
+        "BTTS (No)": btts_no,
+        "Home to Score": p_home_score,
+        "Away to Score": p_away_score,
+        "Over 8.5 Corners": p_over_corners,
+        "Under 10.5 Corners": p_under_corners,
+    }
 
-    top_bet, top_prob = candidates[0]
-    confidence = round(top_prob * 100, 1)
+def recommend_top(prob_table: Dict[str, float]) -> Tuple[str, float, List[Tuple[str, float]]]:
+    items = sorted(prob_table.items(), key=lambda x: x[1], reverse=True)
+    top_bet, top_p = items[0]
+    return top_bet, top_p, items[:6]
 
+def analyze_match(m: MatchItem) -> Dict:
+    probs = build_probability_table(m)
+    top_bet, top_p, top_list = recommend_top(probs)
+    conf = round(top_p * 100, 1)
     return {
         "league": m.league,
         "kickoff": m.kickoff,
         "match": f"{m.home.name} vs {m.away.name}",
-        "home": m.home.name,
-        "away": m.away.name,
-        "expected_total_goals": round(total_goals, 2),
+        "expected_total_goals": round(expected_total_goals(m), 2),
         "top_bet": top_bet,
-        "confidence": confidence,
-        "risk": risk_label(confidence),
-        "all_recs": [(b, round(p * 100, 1)) for b, p in candidates[:5]],
+        "confidence": conf,
+        "risk": risk_label(conf),
+        "prob_table": probs,
+        "top_list": [(b, round(p * 100, 1)) for b, p in top_list],
     }
 
 # =====================
-# BET BUILDER
+# ODDS + SLIP
 # =====================
-def build_slip(analyses: List[Dict]) -> Dict:
+def combined_odds(legs: List[Dict]) -> float:
+    out = 1.0
+    for leg in legs:
+        out *= float(leg["odds"])
+    return out
+
+def implied_probability_from_odds(legs: List[Dict]) -> float:
     p = 1.0
-    for a in analyses:
-        p *= (a["confidence"] / 100.0)
-    hit = round(p * 100, 2)
+    for leg in legs:
+        p *= (1.0 / float(leg["odds"]))
+    return clamp(p, 0.0, 1.0)
 
-    n = len(analyses)
-    if n <= 3:
-        risk = "נמוך"
-    elif n <= 6:
-        risk = "בינוני"
-    else:
-        risk = "גבוה"
-    return {"n": n, "hit": hit, "risk": risk}
-
-def auto_build(analyses: List[Dict], mode: str) -> List[Dict]:
-    # בוחר משחקים לפי confidence
-    sorted_a = sorted(analyses, key=lambda x: x["confidence"], reverse=True)
-    if mode == "3 חזקים":
-        return sorted_a[:3]
-    if mode == "6 סיכון נמוך":
-        # לוקחים 6 עם ביטחון סביר
-        return [a for a in sorted_a if a["confidence"] >= 62][:6] or sorted_a[:6]
-    if mode == "10 אגרסיבי":
-        return sorted_a[:10]
-    return sorted_a[:3]
+def analyst_probability(legs: List[Dict]) -> float:
+    p = 1.0
+    for leg in legs:
+        p *= float(leg["model_p"])
+    return clamp(p, 0.0, 1.0)
 
 # =====================
 # UI
 # =====================
 st.markdown('<div class="big-title">⚽ אנליסט כדורגל חכם להימורים</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtle">עד שה-API יתחבר — אנחנו עובדים במצב דמו עם נתוני דוגמה חזקים ומפתחים את האנליסט והעיצוב.</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtle">מצב דמו עד שה-API יתחבר. אתה בונה טופס עם יחס אמיתי מהאינטרנט ורואה אם זה משתלם.</div>', unsafe_allow_html=True)
 
-# Sidebar controls
+# Sidebar
 st.sidebar.header("🎛 שליטה")
 today = datetime.date.today().strftime("%d/%m/%Y")
 st.sidebar.write(f"📅 היום: {today}")
 
-league_filter = st.sidebar.multiselect(
-    "סינון ליגות",
-    options=["La Liga", "Premier League", "Israel Ligat Ha'Al"],
-    default=["La Liga", "Premier League", "Israel Ligat Ha'Al"],
-)
-
+leagues_all = ["La Liga", "Premier League", "Israel Ligat Ha'Al"]
+league_filter = st.sidebar.multiselect("סינון ליגות", options=leagues_all, default=leagues_all)
 search = st.sidebar.text_input("חיפוש קבוצה/משחק", "")
 
-auto_mode = st.sidebar.selectbox("טופס אוטומטי", ["כבוי", "3 חזקים", "6 סיכון נמוך", "10 אגרסיבי"])
-
-# Data
+# Load + analyze
 matches = demo_matches()
 analyses_all = [analyze_match(m) for m in matches]
 
-# Filter
 analyses = []
 for a in analyses_all:
     if a["league"] not in league_filter:
         continue
-    if search.strip():
-        if search.lower() not in a["match"].lower():
-            continue
+    if search.strip() and (search.lower() not in a["match"].lower()):
+        continue
     analyses.append(a)
 
-# Header metrics
+# Metrics
 colA, colB, colC, colD = st.columns(4)
 colA.metric("מס' משחקים מוצגים", len(analyses))
-colB.metric("ממוצע ביטחון", f'{round(sum(x["confidence"] for x in analyses)/max(1,len(analyses)),1)}%')
+avg_conf = round(sum(x["confidence"] for x in analyses) / max(1, len(analyses)), 1)
+colB.metric("ממוצע ביטחון", f"{avg_conf}%")
 colC.metric("חזקים (>=74%)", sum(1 for x in analyses if x["confidence"] >= 74))
 colD.metric("מסוכנים (<62%)", sum(1 for x in analyses if x["confidence"] < 62))
 
 st.divider()
 
-# Auto build slip
-selected_for_slip = []
-if auto_mode != "כבוי":
-    selected_for_slip = auto_build(analyses, auto_mode)
-    st.info(f"נבנה טופס אוטומטי: **{auto_mode}** (אפשר לשנות ידנית למטה)")
+# Matches + build slip legs
+st.subheader("📌 משחקים והמלצות (בחר הימור + הזן Odds)")
 
-# Matches list
-st.subheader("📌 משחקים והמלצות")
-for a in analyses:
+legs: List[Dict] = []
+for idx, a in enumerate(analyses):
     risk = a["risk"]
     chip_class = "chip-strong" if risk == "חזק" else "chip-mid" if risk == "בינוני" else "chip-risk"
+
     st.markdown(f"""
     <div class="card">
       <div class="row">
@@ -277,29 +306,113 @@ for a in analyses:
     </div>
     """, unsafe_allow_html=True)
 
-    with st.expander("לראות עוד המלצות"):
-        for bet, prob in a["all_recs"]:
-            st.write(f"- **{bet}** — {prob}%")
+    c1, c2, c3, c4 = st.columns([1.6, 1.2, 1.0, 1.2])
 
-# Manual slip
+    default_bet = a["top_bet"]
+    bet_choice = c1.selectbox(
+        "סוג הימור",
+        options=BET_TYPES,
+        index=BET_TYPES.index(default_bet) if default_bet in BET_TYPES else 0,
+        key=f"bet_{idx}"
+    )
+
+    model_p = a["prob_table"].get(bet_choice, 0.50)
+    c2.metric("הערכת הצלחה (אנליסט)", f"{round(model_p*100,1)}%")
+
+    odds = c3.number_input(
+        "Odds (יחס)",
+        min_value=1.01,
+        value=1.70,
+        step=0.01,
+        format="%.2f",
+        key=f"odds_{idx}"
+    )
+
+    add_to_slip = c4.checkbox("הוסף לטופס", value=False, key=f"add_{idx}")
+
+    with st.expander("עוד המלצות"):
+        for b, p in a["top_list"]:
+            st.write(f"- **{b}** — {p}%")
+
+    if add_to_slip:
+        legs.append({
+            "match": a["match"],
+            "league": a["league"],
+            "pick": bet_choice,
+            "odds": float(odds),
+            "model_p": float(model_p),
+        })
+
 st.divider()
-st.header("🧾 בניית טופס חכם")
 
-choices = st.multiselect(
-    "בחר משחקים לטופס ידנית",
-    analyses,
-    default=selected_for_slip,
-    format_func=lambda x: f'{x["match"]} — {x["top_bet"]} ({x["confidence"]}%)'
-)
+# Slip summary + copy/export
+st.header("🧾 הטופס שלך + יחס מהאינטרנט")
 
-if choices:
-    slip = build_slip(choices)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("מספר משחקים", slip["n"])
-    c2.metric("אחוז פגיעה משוער", f'{slip["hit"]}%')
-    c3.metric("רמת סיכון", slip["risk"])
-    st.success("הטופס שלך:")
-    for i, a in enumerate(choices, 1):
-        st.write(f'{i}. **{a["match"]}** — ⭐ {a["top_bet"]} ({a["confidence"]}%)')
+if not legs:
+    st.warning("סמן 'הוסף לטופס' לפחות על משחק אחד.")
 else:
-    st.warning("בחר לפחות משחק אחד כדי לבנות טופס.")
+    stake = st.number_input("כמה אתה שם בטופס? (₪)", min_value=1.0, value=20.0, step=1.0, format="%.0f")
+
+    total_odds = combined_odds(legs)
+    model_p = analyst_probability(legs)
+    implied_p = implied_probability_from_odds(legs)
+    edge = model_p - implied_p
+
+    potential_return = stake * total_odds
+    profit = potential_return - stake
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("מספר משחקים", len(legs))
+    c2.metric("יחס כולל", f"{total_odds:.2f}")
+    c3.metric("החזר פוטנציאלי", f"₪{potential_return:.2f}")
+    c4.metric("רווח פוטנציאלי", f"₪{profit:.2f}")
+
+    c5, c6, c7 = st.columns(3)
+    c5.metric("הצלחה משוערת (אנליסט)", f"{model_p*100:.1f}%")
+    c6.metric("הצלחה משתמעת מהיחסים", f"{implied_p*100:.1f}%")
+    c7.metric("Value (Edge)", f"{edge*100:.1f}%")
+
+    if edge > 0.03:
+        st.success("✅ לפי האנליסט יש פה Value.")
+    elif edge < -0.03:
+        st.error("⚠️ לפי האנליסט היחסים לא משתלמים.")
+    else:
+        st.info("ℹ️ גבולי — אין יתרון ברור.")
+
+    st.subheader("📋 פירוט הטופס")
+    for i, leg in enumerate(legs, 1):
+        st.write(f'{i}. **{leg["match"]}** — {leg["pick"]} | יחס: **{leg["odds"]:.2f}** | סיכוי אנליסט: **{leg["model_p"]*100:.1f}%**')
+
+    # ===== COPY / EXPORT =====
+    st.divider()
+    st.subheader("📋 העתקה/ייצוא הטופס")
+
+    lines = []
+    lines.append("טופס הימורים (נבנה באתר האנליסט)")
+    lines.append(f"תאריך: {datetime.date.today().strftime('%d/%m/%Y')}")
+    lines.append("")
+    for i, leg in enumerate(legs, 1):
+        lines.append(f"{i}. {leg['match']} — {leg['pick']} @ {leg['odds']:.2f}")
+    lines.append("")
+    lines.append(f"יחס כולל: {total_odds:.2f}")
+    lines.append(f"סטייק: ₪{stake:.0f}")
+    lines.append(f"החזר פוטנציאלי: ₪{potential_return:.2f}")
+    lines.append(f"רווח פוטנציאלי: ₪{profit:.2f}")
+    lines.append("")
+    lines.append(f"הצלחה משוערת (אנליסט): {model_p*100:.1f}%")
+    lines.append(f"הצלחה משתמעת מהיחסים: {implied_p*100:.1f}%")
+    lines.append(f"Value (Edge): {edge*100:.1f}%")
+
+    slip_text = "\n".join(lines)
+
+    if st.button("📋 צור טקסט להעתקה"):
+        st.text_area("העתק (Ctrl+A ואז Ctrl+C):", slip_text, height=220)
+
+    st.download_button(
+        "⬇️ הורד כקובץ TXT",
+        data=slip_text.encode("utf-8"),
+        file_name="bet_slip.txt",
+        mime="text/plain"
+    )
+
+    st.caption("אזהרה: זה כלי עזר בלבד. בהימורים אין ודאות, והיחסים כוללים מרווח של סוכנויות.")
